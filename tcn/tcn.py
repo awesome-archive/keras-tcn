@@ -1,173 +1,398 @@
-import keras.backend as K
-import keras.layers
-from keras import optimizers
-from keras.engine.topology import Layer
-from keras.layers import Activation, Lambda
-from keras.layers import Conv1D, SpatialDropout1D
-from keras.layers import Convolution1D, Dense
-from keras.models import Input, Model
-from typing import List, Tuple
+import inspect
+from typing import List  # noqa
+
+import tensorflow as tf
+try:
+    # pylint: disable=E0611,E0401
+    from keras.src.saving import register_keras_serializable  # For recent Keras
+except ImportError:
+    # pylint: disable=E0611,E0401
+    from tensorflow.keras.saving import register_keras_serializable  # For older versions
+
+# pylint: disable=E0611,E0401
+from tensorflow.keras import backend as K, Model, Input, optimizers
+# pylint: disable=E0611,E0401
+from tensorflow.keras import layers
+# pylint: disable=E0611,E0401
+from tensorflow.keras.layers import Activation, SpatialDropout1D, Lambda
+# pylint: disable=E0611,E0401
+from tensorflow.keras.layers import Layer, Conv1D, Dense, BatchNormalization, LayerNormalization
 
 
-def channel_normalization(x):
-    # type: (Layer) -> Layer
-    """ Normalize a layer to the maximum activation
-
-    This keeps a layers values between zero and one.
-    It helps with relu's unbounded activation
-
-    Args:
-        x: The layer to normalize
-
-    Returns:
-        A maximal normalized layer
-    """
-    max_values = K.max(K.abs(x), 2, keepdims=True) + 1e-5
-    out = x / max_values
-    return out
+def is_power_of_two(num: int):
+    return num != 0 and ((num & (num - 1)) == 0)
 
 
-def wave_net_activation(x):
-    # type: (Layer) -> Layer
-    """This method defines the activation used for WaveNet
-
-    described in https://deepmind.com/blog/wavenet-generative-model-raw-audio/
-
-    Args:
-        x: The layer we want to apply the activation to
-
-    Returns:
-        A new layer with the wavenet activation applied
-    """
-    tanh_out = Activation('tanh')(x)
-    sigm_out = Activation('sigmoid')(x)
-    return keras.layers.multiply([tanh_out, sigm_out])
-
-
-def residual_block(x, s, i, activation, nb_filters, kernel_size, padding, dropout_rate=0, name=''):
-    # type: (Layer, int, int, str, int, int, str, float, str) -> Tuple[Layer, Layer]
-    """Defines the residual block for the WaveNet TCN
-
-    Args:
-        x: The previous layer in the model
-        s: The stack index i.e. which stack in the overall TCN
-        i: The dilation power of 2 we are using for this residual block
-        activation: The name of the type of activation to use
-        nb_filters: The number of convolutional filters to use in this block
-        kernel_size: The size of the convolutional kernel
-        padding: The padding used in the convolutional layers, 'same' or 'causal'.
-        dropout_rate: Float between 0 and 1. Fraction of the input units to drop.
-        name: Name of the model. Useful when having multiple TCN.
-
-    Returns:
-        A tuple where the first element is the residual model layer, and the second
-        is the skip connection.
-    """
-
-    original_x = x
-    conv = Conv1D(filters=nb_filters, kernel_size=kernel_size,
-                  dilation_rate=i, padding=padding,
-                  name=name + '_d_%s_conv_%d_tanh_s%d' % (padding, i, s))(x)
-    if activation == 'norm_relu':
-        x = Activation('relu')(conv)
-        x = Lambda(channel_normalization)(x)
-    elif activation == 'wavenet':
-        x = wave_net_activation(conv)
-    else:
-        x = Activation(activation)(conv)
-
-    x = SpatialDropout1D(dropout_rate, name=name + '_spatial_dropout1d_%d_s%d_%f' % (i, s, dropout_rate))(x)
-
-    # 1x1 conv.
-    x = Convolution1D(nb_filters, 1, padding='same')(x)
-    res_x = keras.layers.add([original_x, x])
-    return res_x, x
-
-
-def process_dilations(dilations):
-    def is_power_of_two(num):
-        return num != 0 and ((num & (num - 1)) == 0)
-
+def adjust_dilations(dilations: list):
     if all([is_power_of_two(i) for i in dilations]):
         return dilations
-
     else:
         new_dilations = [2 ** i for i in dilations]
-        # print(f'Updated dilations from {dilations} to {new_dilations} because of backwards compatibility.')
         return new_dilations
 
 
-class TCN:
+class ResidualBlock(Layer):
+
+    def __init__(self,
+                 dilation_rate: int,
+                 nb_filters: int,
+                 kernel_size: int,
+                 padding: str,
+                 activation: str = 'relu',
+                 dropout_rate: float = 0,
+                 kernel_initializer: str = 'he_normal',
+                 use_batch_norm: bool = False,
+                 use_layer_norm: bool = False,
+                 **kwargs):
+        """Defines the residual block for the WaveNet TCN
+        Args:
+            x: The previous layer in the model
+            training: boolean indicating whether the layer should behave in training mode or in inference mode
+            dilation_rate: The dilation power of 2 we are using for this residual block
+            nb_filters: The number of convolutional filters to use in this block
+            kernel_size: The size of the convolutional kernel
+            padding: The padding used in the convolutional layers, 'same' or 'causal'.
+            activation: The final activation used in o = Activation(x + F(x))
+            dropout_rate: Float between 0 and 1. Fraction of the input units to drop.
+            kernel_initializer: Initializer for the kernel weights matrix (Conv1D).
+            use_batch_norm: Whether to use batch normalization in the residual layers or not.
+            use_layer_norm: Whether to use layer normalization in the residual layers or not.
+            kwargs: Any initializers for Layer class.
+        """
+
+        self.dilation_rate = dilation_rate
+        self.nb_filters = nb_filters
+        self.kernel_size = kernel_size
+        self.padding = padding
+        self.activation = activation
+        self.dropout_rate = dropout_rate
+        self.use_batch_norm = use_batch_norm
+        self.use_layer_norm = use_layer_norm
+        self.kernel_initializer = kernel_initializer
+        self.layers = []
+        self.shape_match_conv = None
+        self.res_output_shape = None
+        self.final_activation = None
+        self.batch_norm_layers = []
+        self.layer_norm_layers = []
+
+        super(ResidualBlock, self).__init__(**kwargs)
+
+    def _build_layer(self, layer):
+        """Helper function for building layer
+        Args:
+            layer: Appends layer to internal layer list and builds it based on the current output
+                   shape of ResidualBlocK. Updates current output shape.
+        """
+        self.layers.append(layer)
+        self.layers[-1].build(self.res_output_shape)
+        self.res_output_shape = self.layers[-1].compute_output_shape(self.res_output_shape)
+
+    def build(self, input_shape):
+
+        with K.name_scope(self.name):  # name scope used to make sure weights get unique names
+            self.layers = []
+            self.res_output_shape = input_shape
+
+            for k in range(2):  # dilated conv block.
+                name = 'conv1D_{}'.format(k)
+                with K.name_scope(name):  # name scope used to make sure weights get unique names
+                    conv = Conv1D(
+                        filters=self.nb_filters,
+                        kernel_size=self.kernel_size,
+                        dilation_rate=self.dilation_rate,
+                        padding=self.padding,
+                        name=name,
+                        kernel_initializer=self.kernel_initializer
+                    )
+                    self._build_layer(conv)
+
+                with K.name_scope('norm_{}'.format(k)):
+                    if self.use_batch_norm:
+                        bn_layer = BatchNormalization()
+                        self.batch_norm_layers.append(bn_layer)
+                        self._build_layer(bn_layer)
+                    elif self.use_layer_norm:
+                        ln_layer = LayerNormalization()
+                        self.layer_norm_layers.append(ln_layer)
+                        self._build_layer(ln_layer)
+
+                with K.name_scope('act_and_dropout_{}'.format(k)):
+                    self._build_layer(Activation(self.activation, name='Act_Conv1D_{}'.format(k)))
+                    self._build_layer(SpatialDropout1D(rate=self.dropout_rate, name='SDropout_{}'.format(k)))
+
+            if self.nb_filters != input_shape[-1]:
+                # 1x1 conv to match the shapes (channel dimension).
+                name = 'matching_conv1D'
+                with K.name_scope(name):
+                    # make and build this layer separately because it directly uses input_shape.
+                    # 1x1 conv.
+                    self.shape_match_conv = Conv1D(
+                        filters=self.nb_filters,
+                        kernel_size=1,
+                        padding='same',
+                        name=name,
+                        kernel_initializer=self.kernel_initializer
+                    )
+            else:
+                name = 'matching_identity'
+                self.shape_match_conv = Lambda(lambda x: x, name=name)
+
+            with K.name_scope(name):
+                self.shape_match_conv.build(input_shape)
+                self.res_output_shape = self.shape_match_conv.compute_output_shape(input_shape)
+
+            self._build_layer(Activation(self.activation, name='Act_Conv_Blocks'))
+            self.final_activation = Activation(self.activation, name='Act_Res_Block')
+            self.final_activation.build(self.res_output_shape)  # probably isn't necessary
+
+            # this is done to force Keras to add the layers in the list to self._layers
+            for layer in self.layers:
+                self.__setattr__(layer.name, layer)
+            self.__setattr__(self.shape_match_conv.name, self.shape_match_conv)
+            self.__setattr__(self.final_activation.name, self.final_activation)
+
+            super(ResidualBlock, self).build(input_shape)  # done to make sure self.built is set True
+
+    def call(self, inputs, training=None, **kwargs):
+        """
+        Returns: A tuple where the first element is the residual model tensor, and the second
+                 is the skip connection tensor.
+        """
+        # https://arxiv.org/pdf/1803.01271.pdf  page 4, Figure 1 (b).
+        # x1: Dilated Conv -> Norm -> Dropout (x2).
+        # x2: Residual (1x1 matching conv - optional).
+        # Output: x1 + x2.
+        # x1 -> connected to skip connections.
+        # x1 + x2 -> connected to the next block.
+        #       input
+        #     x1      x2
+        #   conv1D    1x1 Conv1D (optional)
+        #    ...
+        #   conv1D
+        #    ...
+        #       x1 + x2
+        x1 = inputs
+        for layer in self.layers:
+            training_flag = 'training' in dict(inspect.signature(layer.call).parameters)
+            x1 = layer(x1, training=training) if training_flag else layer(x1)
+        x2 = self.shape_match_conv(inputs)
+        x1_x2 = self.final_activation(layers.add([x2, x1], name='Add_Res'))
+        return [x1_x2, x1]
+
+    def compute_output_shape(self, input_shape):
+        return [self.res_output_shape, self.res_output_shape]
+
+
+@register_keras_serializable()
+class TCN(Layer):
     """Creates a TCN layer.
 
         Input shape:
-            A tensor of shape (batch_size, timesteps, input_dim).
+            A 3D tensor with shape (batch_size, timesteps, input_dim).
 
         Args:
-            nb_filters: The number of filters to use in the convolutional layers.
+            nb_filters: The number of filters to use in the convolutional layers. Can be a list.
             kernel_size: The size of the kernel to use in each convolutional layer.
             dilations: The list of the dilations. Example is: [1, 2, 4, 8, 16, 32, 64].
             nb_stacks : The number of stacks of residual blocks to use.
-            activation: The activations to use (norm_relu, wavenet, relu...).
             padding: The padding to use in the convolutional layers, 'causal' or 'same'.
-            use_skip_connections: Boolean. If we want to add skip connections from input to each residual block.
+            use_skip_connections: Boolean. If we want to add skip connections from input to each residual blocK.
             return_sequences: Boolean. Whether to return the last output in the output sequence, or the full sequence.
+            activation: The activation used in the residual blocks o = Activation(x + F(x)).
             dropout_rate: Float between 0 and 1. Fraction of the input units to drop.
-            name: Name of the model. Useful when having multiple TCN.
-
+            kernel_initializer: Initializer for the kernel weights matrix (Conv1D).
+            use_batch_norm: Whether to use batch normalization in the residual layers or not.
+            use_layer_norm: Whether to use layer normalization in the residual layers or not.
+            go_backwards: Boolean (default False). If True, process the input sequence backwards and
+            return the reversed sequence.
+            return_state: Boolean. Whether to return the last state in addition to the output. Default: False.
+            kwargs: Any other arguments for configuring parent class Layer. For example "name=str", Name of the model.
+                    Use unique names when using multiple TCN.
         Returns:
             A TCN layer.
         """
 
     def __init__(self,
                  nb_filters=64,
-                 kernel_size=2,
+                 kernel_size=3,
                  nb_stacks=1,
-                 dilations=[1, 2, 4, 8, 16, 32],
-                 activation='norm_relu',
+                 dilations=(1, 2, 4, 8, 16, 32),
                  padding='causal',
                  use_skip_connections=True,
                  dropout_rate=0.0,
-                 return_sequences=True,
-                 name='tcn'):
-        self.name = name
+                 return_sequences=False,
+                 activation='relu',
+                 kernel_initializer='he_normal',
+                 use_batch_norm=False,
+                 use_layer_norm=False,
+                 go_backwards=False,
+                 return_state=False,
+                 **kwargs):
+        self.stateful = False  # TCN are not stateful. Keras requires this parameter.
         self.return_sequences = return_sequences
         self.dropout_rate = dropout_rate
         self.use_skip_connections = use_skip_connections
-        self.activation = activation
         self.dilations = dilations
         self.nb_stacks = nb_stacks
         self.kernel_size = kernel_size
         self.nb_filters = nb_filters
+        self.activation_name = activation
         self.padding = padding
+        self.kernel_initializer = kernel_initializer
+        self.use_batch_norm = use_batch_norm
+        self.use_layer_norm = use_layer_norm
+        self.go_backwards = go_backwards
+        self.return_state = return_state
+        self.skip_connections = []
+        self.residual_blocks = []
+        self.layers_outputs = []
+        self.build_output_shape = None
+        self.slicer_layer = None  # in case return_sequence=False
+        self.output_slice_index = None  # in case return_sequence=False
+        self.padding_same_and_time_dim_unknown = False  # edge case if padding='same' and time_dim = None
+
+        if self.use_batch_norm + self.use_layer_norm > 1:
+            raise ValueError('Only one normalization can be specified at once.')
+
+        if isinstance(self.nb_filters, list):
+            assert len(self.nb_filters) == len(self.dilations)
+            if len(set(self.nb_filters)) > 1 and self.use_skip_connections:
+                raise ValueError('Skip connections are not compatible '
+                                 'with a list of filters, unless they are all equal.')
 
         if padding != 'causal' and padding != 'same':
             raise ValueError("Only 'causal' or 'same' padding are compatible for this layer.")
 
-        if not isinstance(nb_filters, int):
-            print('An interface change occurred after the version 2.1.2.')
-            print('Before: tcn.TCN(i, return_sequences=False, ...)')
-            print('Now should be: tcn.TCN(return_sequences=False, ...)(i)')
-            print('Second solution is to pip install keras-tcn==2.1.2 to downgrade.')
-            raise Exception()
+        # initialize parent class
+        super(TCN, self).__init__(**kwargs)
 
-    def __call__(self, inputs):
-        x = inputs
-        x = Convolution1D(self.nb_filters, 1, padding=self.padding, name=self.name + '_initial_conv')(x)
-        skip_connections = []
+    @property
+    def receptive_field(self):
+        return 1 + 2 * (self.kernel_size - 1) * self.nb_stacks * sum(self.dilations)
+
+    def tolist(self, shape):
+        # noinspection PyBroadException
+        try:
+            return shape.as_list()
+        except Exception:
+            return list(shape)
+
+    def build(self, input_shape):
+
+        # member to hold current output shape of the layer for building purposes
+        self.build_output_shape = input_shape
+
+        # list to hold all the member ResidualBlocks
+        self.residual_blocks = []
+        total_num_blocks = self.nb_stacks * len(self.dilations)
+        if not self.use_skip_connections:
+            total_num_blocks += 1  # cheap way to do a false case for below
+
         for s in range(self.nb_stacks):
-            for i in self.dilations:
-                x, skip_out = residual_block(x, s, i, self.activation, self.nb_filters,
-                                             self.kernel_size, self.padding, self.dropout_rate, name=self.name)
-                skip_connections.append(skip_out)
+            for i, d in enumerate(self.dilations):
+                res_block_filters = self.nb_filters[i] if isinstance(self.nb_filters, list) else self.nb_filters
+                self.residual_blocks.append(ResidualBlock(dilation_rate=d,
+                                                          nb_filters=res_block_filters,
+                                                          kernel_size=self.kernel_size,
+                                                          padding=self.padding,
+                                                          activation=self.activation_name,
+                                                          dropout_rate=self.dropout_rate,
+                                                          use_batch_norm=self.use_batch_norm,
+                                                          use_layer_norm=self.use_layer_norm,
+                                                          kernel_initializer=self.kernel_initializer,
+                                                          name='residual_block_{}'.format(len(self.residual_blocks))))
+                # build newest residual block
+                self.residual_blocks[-1].build(self.build_output_shape)
+                self.build_output_shape = self.residual_blocks[-1].res_output_shape
+
+        # this is done to force keras to add the layers in the list to self._layers
+        for layer in self.residual_blocks:
+            self.__setattr__(layer.name, layer)
+
+        self.output_slice_index = None
+        if self.padding == 'same':
+            time = self.tolist(self.build_output_shape)[1]
+            if time is not None:  # if time dimension is defined. e.g. shape = (bs, 500, input_dim).
+                self.output_slice_index = int(self.tolist(self.build_output_shape)[1] / 2)
+            else:
+                # It will known at call time. c.f. self.call.
+                self.padding_same_and_time_dim_unknown = True
+
+        else:
+            self.output_slice_index = -1  # causal case.
+        self.slicer_layer = Lambda(lambda tt: tt[:, self.output_slice_index, :], name='Slice_Output')
+        self.slicer_layer.build(self.tolist(self.build_output_shape))
+
+    def compute_output_shape(self, input_shape):
+        """
+        Overridden in case keras uses it somewhere... no idea. Just trying to avoid future errors.
+        """
+        if not self.built:
+            self.build(input_shape)
+        if not self.return_sequences:
+            batch_size = self.build_output_shape[0]
+            batch_size = batch_size.value if hasattr(batch_size, 'value') else batch_size
+            nb_filters = self.build_output_shape[-1]
+            return [batch_size, nb_filters]
+        else:
+            # Compatibility tensorflow 1.x
+            return [v.value if hasattr(v, 'value') else v for v in self.build_output_shape]
+
+    def call(self, inputs, training=None, **kwargs):
+        x = inputs
+
+        if self.go_backwards:
+            # reverse x in the time axis
+            x = tf.reverse(x, axis=[1])
+
+        self.layers_outputs = [x]
+        self.skip_connections = []
+        for res_block in self.residual_blocks:
+            try:
+                x, skip_out = res_block(x, training=training)
+            except TypeError:  # compatibility with tensorflow 1.x
+                x, skip_out = res_block(K.cast(x, 'float32'), training=training)
+            self.skip_connections.append(skip_out)
+            self.layers_outputs.append(x)
+
         if self.use_skip_connections:
-            x = keras.layers.add(skip_connections)
-        x = Activation('relu')(x)
+            if len(self.skip_connections) > 1:
+                # Keras: A merge layer should be called on a list of at least 2 inputs. Got 1 input.
+                x = layers.add(self.skip_connections, name='Add_Skip_Connections')
+            else:
+                x = self.skip_connections[0]
+            self.layers_outputs.append(x)
 
         if not self.return_sequences:
-            output_slice_index = -1
-            x = Lambda(lambda tt: tt[:, output_slice_index, :])(x)
+            # case: time dimension is unknown. e.g. (bs, None, input_dim).
+            if self.padding_same_and_time_dim_unknown:
+                self.output_slice_index = K.shape(self.layers_outputs[-1])[1] // 2
+            x = self.slicer_layer(x)
+            self.layers_outputs.append(x)
         return x
+
+    def get_config(self):
+        """
+        Returns the config of a the layer. This is used for saving and loading from a model
+        :return: python dictionary with specs to rebuild layer
+        """
+        config = super(TCN, self).get_config()
+        config['nb_filters'] = self.nb_filters
+        config['kernel_size'] = self.kernel_size
+        config['nb_stacks'] = self.nb_stacks
+        config['dilations'] = self.dilations
+        config['padding'] = self.padding
+        config['use_skip_connections'] = self.use_skip_connections
+        config['dropout_rate'] = self.dropout_rate
+        config['return_sequences'] = self.return_sequences
+        config['activation'] = self.activation_name
+        config['use_batch_norm'] = self.use_batch_norm
+        config['use_layer_norm'] = self.use_layer_norm
+        config['kernel_initializer'] = self.kernel_initializer
+        config['go_backwards'] = self.go_backwards
+        config['return_state'] = self.return_state
+        return config
 
 
 def compiled_tcn(num_feat,  # type: int
@@ -177,58 +402,76 @@ def compiled_tcn(num_feat,  # type: int
                  dilations,  # type: List[int]
                  nb_stacks,  # type: int
                  max_len,  # type: int
-                 activation='norm_relu',  # type: str
+                 output_len=1,  # type: int
                  padding='causal',  # type: str
-                 use_skip_connections=True,  # type: bool
+                 use_skip_connections=False,  # type: bool
                  return_sequences=True,
                  regression=False,  # type: bool
                  dropout_rate=0.05,  # type: float
-                 name='tcn'  # type: str
-                 ):
-    # type: (...) -> keras.Model
+                 name='tcn',  # type: str,
+                 kernel_initializer='he_normal',  # type: str,
+                 activation='relu',  # type:str,
+                 opt='adam',
+                 lr=0.002,
+                 use_batch_norm=False,
+                 use_layer_norm=False):
+    # type: (...) -> Model
     """Creates a compiled TCN model for a given task (i.e. regression or classification).
+    Classification uses a sparse categorical loss. Please input class ids and not one-hot encodings.
 
     Args:
         num_feat: The number of features of your input, i.e. the last dimension of: (batch_size, timesteps, input_dim).
-        num_classes: The size of the final dense layer, how many classes we are predicting.
+        num_classes: The size of the final dense layer, how many classes we are predicting. Only valid when regression=False.
         nb_filters: The number of filters to use in the convolutional layers.
         kernel_size: The size of the kernel to use in each convolutional layer.
         dilations: The list of the dilations. Example is: [1, 2, 4, 8, 16, 32, 64].
         nb_stacks : The number of stacks of residual blocks to use.
         max_len: The maximum sequence length, use None if the sequence length is dynamic.
-        activation: The activations to use.
         padding: The padding to use in the convolutional layers.
-        use_skip_connections: Boolean. If we want to add skip connections from input to each residual block.
+        use_skip_connections: Boolean. If we want to add skip connections from input to each residual blocK.
         return_sequences: Boolean. Whether to return the last output in the output sequence, or the full sequence.
         regression: Whether the output should be continuous or discrete.
         dropout_rate: Float between 0 and 1. Fraction of the input units to drop.
+        activation: The activation used in the residual blocks o = Activation(x + F(x)).
         name: Name of the model. Useful when having multiple TCN.
-
+        kernel_initializer: Initializer for the kernel weights matrix (Conv1D).
+        opt: Optimizer name.
+        lr: Learning rate.
+        use_batch_norm: Whether to use batch normalization in the residual layers or not.
+        use_layer_norm: Whether to use layer normalization in the residual layers or not.
     Returns:
         A compiled keras TCN.
     """
 
-    dilations = process_dilations(dilations)
+    dilations = adjust_dilations(dilations)
 
     input_layer = Input(shape=(max_len, num_feat))
 
-    x = TCN(nb_filters, kernel_size, nb_stacks, dilations, activation,
-            padding, use_skip_connections, dropout_rate, return_sequences, name)(input_layer)
+    x = TCN(nb_filters, kernel_size, nb_stacks, dilations, padding,
+            use_skip_connections, dropout_rate, return_sequences,
+            activation, kernel_initializer, use_batch_norm, use_layer_norm,
+            name=name)(input_layer)
 
     print('x.shape=', x.shape)
+
+    def get_opt():
+        if opt == 'adam':
+            return optimizers.Adam(lr, clipnorm=1.)
+        elif opt == 'rmsprop':
+            return optimizers.RMSprop(lr, clipnorm=1.)
+        else:
+            raise Exception('Only Adam and RMSProp are available here')
 
     if not regression:
         # classification
         x = Dense(num_classes)(x)
         x = Activation('softmax')(x)
         output_layer = x
-        print(f'model.x = {input_layer.shape}')
-        print(f'model.y = {output_layer.shape}')
         model = Model(input_layer, output_layer)
 
         # https://github.com/keras-team/keras/pull/11373
         # It's now in Keras@master but still not available with pip.
-        # TODO To remove later.
+        # TODO remove later.
         def accuracy(y_true, y_pred):
             # reshape in case it's in shape (num_samples, 1) instead of (num_samples,)
             if K.ndim(y_true) == K.ndim(y_pred):
@@ -238,18 +481,48 @@ def compiled_tcn(num_feat,  # type: int
             y_pred_labels = K.cast(y_pred_labels, K.floatx())
             return K.cast(K.equal(y_true, y_pred_labels), K.floatx())
 
-        adam = optimizers.Adam(lr=0.002, clipnorm=1.)
-        model.compile(adam, loss='sparse_categorical_crossentropy', metrics=[accuracy])
-        print('Adam with norm clipping.')
+        model.compile(get_opt(), loss='sparse_categorical_crossentropy', metrics=[accuracy])
     else:
         # regression
-        x = Dense(1)(x)
+        x = Dense(output_len)(x)
         x = Activation('linear')(x)
         output_layer = x
-        print(f'model.x = {input_layer.shape}')
-        print(f'model.y = {output_layer.shape}')
         model = Model(input_layer, output_layer)
-        adam = optimizers.Adam(lr=0.002, clipnorm=1.)
-        model.compile(adam, loss='mean_squared_error')
-
+        model.compile(get_opt(), loss='mean_squared_error')
+    print('model.x = {}'.format(input_layer.shape))
+    print('model.y = {}'.format(output_layer.shape))
     return model
+
+
+def tcn_full_summary(model: Model, expand_residual_blocks=True):
+    import tensorflow as tf
+    # 2.6.0-rc1, 2.5.0...
+    versions = [int(v) for v in tf.__version__.split('-')[0].split('.')]
+    if versions[0] <= 2 and versions[1] < 5:
+        layers = model._layers.copy()  # store existing layers
+        model._layers.clear()  # clear layers
+
+        for i in range(len(layers)):
+            if isinstance(layers[i], TCN):
+                for layer in layers[i]._layers:
+                    if not isinstance(layer, ResidualBlock):
+                        if not hasattr(layer, '__iter__'):
+                            model._layers.append(layer)
+                    else:
+                        if expand_residual_blocks:
+                            for lyr in layer._layers:
+                                if not hasattr(lyr, '__iter__'):
+                                    model._layers.append(lyr)
+                        else:
+                            model._layers.append(layer)
+            else:
+                model._layers.append(layers[i])
+
+        model.summary()  # print summary
+
+        # restore original layers
+        model._layers.clear()
+        [model._layers.append(lyr) for lyr in layers]
+    else:
+        print('WARNING: tcn_full_summary: Compatible with tensorflow 2.5.0 or below.')
+        print('Use tensorboard instead. Example in keras-tcn/tasks/tcn_tensorboard.py.')

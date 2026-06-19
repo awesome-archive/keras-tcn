@@ -1,139 +1,126 @@
 # Keras TCN
 
+*Keras Temporal Convolutional Network*. [[paper](https://arxiv.org/abs/1803.01271)]
+
+Tested with Tensorflow 2.9, 2.10, 2.11, 2.12, 2.13, 2.14, 2.15, 2.16, 2.17, 2.18, 2.19 (Mar 13, 2025).
+
+For a fully working example of Keras TCN using **R Language**, [browse here](https://github.com/philipperemy/keras-tcn/issues/246).
+
 [![Downloads](https://pepy.tech/badge/keras-tcn)](https://pepy.tech/project/keras-tcn)
 [![Downloads](https://pepy.tech/badge/keras-tcn/month)](https://pepy.tech/project/keras-tcn)
+![Keras TCN CI](https://github.com/philipperemy/keras-tcn/workflows/Keras%20TCN%20CI/badge.svg?branch=master)
 ```bash
 pip install keras-tcn
 ```
 
-*Keras Temporal Convolutional Network*
+For [MacOS users](https://developer.apple.com/metal/tensorflow-plugin/) to use the GPU: `pip install tensorflow-metal`.
 
-   * [Keras TCN](#keras-tcn)
-      * [Why Temporal Convolutional Network?](#why-temporal-convolutional-network)
-      * [API](#api)
-         * [Arguments](#arguments)
-         * [Input shape](#input-shape)
-         * [Output shape](#output-shape)
-         * [Receptive field](#receptive-field)
-         * [Non-causal TCN](#non-causal-tcn)
-      * [Installation](#installation)
-      * [Run](#run)
-      * [Tasks](#tasks)
-         * [Adding Task](#adding-task)
-            * [Explanation](#explanation)
-            * [Implementation results](#implementation-results)
-         * [Copy Memory Task](#copy-memory-task)
-            * [Explanation](#explanation-1)
-            * [Implementation results (first epochs)](#implementation-results-first-epochs)
-         * [Sequential MNIST](#sequential-mnist)
-            * [Explanation](#explanation-2)
-            * [Implementation results](#implementation-results-1)
-      * [References](#references)
-
-## Why Temporal Convolutional Network?
+## Why TCN (Temporal Convolutional Network) instead of LSTM/GRU?
 
 - TCNs exhibit longer memory than recurrent architectures with the same capacity.
-- Constantly performs better than LSTM/GRU architectures on a vast range of tasks (Seq. MNIST, Adding Problem, Copy Memory, Word-level PTB...).
-- Parallelism, flexible receptive field size, stable gradients, low memory requirements for training, variable length inputs...
+- Performs better than LSTM/GRU on long time series (Seq. MNIST, Adding Problem, Copy Memory, Word-level PTB...).
+- Parallelism (convolutional layers), flexible receptive field size (how far the model can see), stable gradients (compared to backpropagation through time, vanishing gradients)...
 
 <p align="center">
   <img src="misc/Dilated_Conv.png">
   <b>Visualization of a stack of dilated causal convolutional layers (Wavenet, 2016)</b><br><br>
 </p>
 
-## API
+## TCN Layer
 
-The usual way is to import the TCN layer and use it inside a Keras model. I provide a snippet below to illustrate it on a regression task (cf. `tasks/` for other examples):
-
-```python
-from keras.layers import Dense
-from keras.models import Input, Model
-
-from tcn import TCN
-
-batch_size, timesteps, input_dim = None, 20, 1
-
-
-def get_x_y(size=1000):
-    import numpy as np
-    pos_indices = np.random.choice(size, size=int(size // 2), replace=False)
-    x_train = np.zeros(shape=(size, timesteps, 1))
-    y_train = np.zeros(shape=(size, 1))
-    x_train[pos_indices, 0] = 1.0
-    y_train[pos_indices, 0] = 1.0
-    return x_train, y_train
-
-
-i = Input(batch_shape=(batch_size, timesteps, input_dim))
-
-o = TCN(return_sequences=False)(i)  # The TCN layers are here.
-o = Dense(1)(o)
-
-m = Model(inputs=[i], outputs=[o])
-m.compile(optimizer='adam', loss='mse')
-
-x, y = get_x_y()
-m.fit(x, y, epochs=10, validation_split=0.2)
-```
-
-In the example above, TCNs can also be stacked together, like this:
+### TCN Class
 
 ```python
-o = TCN(return_sequences=True, name='TCN_1')(i)
-o = TCN(return_sequences=False, name='TCN_2')(o)
-```
-
-I also provide a ready to use TCN model that can be imported and used this way (cf. `tasks/` for the full code):
-
-```python
-from tcn import compiled_tcn
-
-model = compiled_tcn(...)
-model.fit(x, y) # Keras model.
+TCN(
+    nb_filters=64,
+    kernel_size=3,
+    nb_stacks=1,
+    dilations=(1, 2, 4, 8, 16, 32),
+    padding='causal',
+    use_skip_connections=True,
+    dropout_rate=0.0,
+    return_sequences=False,
+    activation='relu',
+    kernel_initializer='he_normal',
+    use_batch_norm=False,
+    use_layer_norm=False,
+    go_backwards=False,
+    return_state=False,
+    **kwargs
+)
 ```
 
 ### Arguments
 
-`tcn.TCN(nb_filters=64, kernel_size=2, nb_stacks=1, dilations=[1, 2, 4, 8, 16, 32], activation='norm_relu', padding='causal', use_skip_connections=True, dropout_rate=0.0, return_sequences=True, name='tcn')`
-
-- `nb_filters`: Integer. The number of filters to use in the convolutional layers.
+- `nb_filters`: Integer. The number of filters to use in the convolutional layers. Would be similar to `units` for LSTM. Can be a list.
 - `kernel_size`: Integer. The size of the kernel to use in each convolutional layer.
-- `dilations`: List. A dilation list. Example is: [1, 2, 4, 8, 16, 32, 64].
+- `dilations`: List/Tuple. A dilation list. Example is: [1, 2, 4, 8, 16, 32, 64].
 - `nb_stacks`: Integer. The number of stacks of residual blocks to use.
-- `activation`: String. The activations to use in the residual blocks (norm_relu, wavenet, relu...).
 - `padding`: String. The padding to use in the convolutions. 'causal' for a causal network (as in the original implementation) and 'same' for a non-causal network.
 - `use_skip_connections`: Boolean. If we want to add skip connections from input to each residual block.
 - `return_sequences`: Boolean. Whether to return the last output in the output sequence, or the full sequence.
 - `dropout_rate`: Float between 0 and 1. Fraction of the input units to drop.
-- `name`: Name of the model. Useful when having multiple TCN.
+- `activation`: The activation used in the residual blocks o = activation(x + F(x)).
+- `kernel_initializer`: Initializer for the kernel weights matrix (Conv1D).
+- `use_batch_norm`: Whether to use batch normalization in the residual layers or not.
+- `use_layer_norm`: Whether to use layer normalization in the residual layers or not.
+- `go_backwards`: Boolean (default False). If True, process the input sequence backwards and return the reversed sequence.
+- `return_state`: Boolean. Whether to return the last state in addition to the output. Default: False.
+- `kwargs`: Any other set of arguments for configuring the parent class Layer. For example "name=str", Name of the model. Use unique names when using multiple TCN.
 
 ### Input shape
 
 3D tensor with shape `(batch_size, timesteps, input_dim)`.
 
-`timesteps` can be None. This can be useful if each sequence is of a different length: [Multiple Length Sequence Example](tasks/multi_length_sequences.py).
+`timesteps` can be `None`. This can be useful if each sequence is of a different length: [Multiple Length Sequence Example](tasks/multi_length_sequences.py).
 
 ### Output shape
 
-It depends on the task (cf. below for examples):
+- if `return_sequences=True`: 3D tensor with shape `(batch_size, timesteps, nb_filters)`.
+- if `return_sequences=False`: 2D tensor with shape `(batch_size, nb_filters)`.
 
-- Regression (Many to one) e.g. adding problem
-- Classification (Many to many) e.g. copy memory task
-- Classification (Many to one) e.g. sequential mnist task
 
-For a Many to Many regression, a cheap fix for now is to change the [number of units of the final Dense layer](https://github.com/philipperemy/keras-tcn/blob/8151b4a87f906fd856fd1c113c48392d542d0994/tcn/tcn.py#L90).
+### How do I choose the correct set of parameters to configure my TCN layer?
+
+Here are some of my notes regarding my experience using TCN:
+
+- `nb_filters`: Present in any ConvNet architecture. It is linked to the predictive power of the model and affects the size of your network. The more, the better unless you start to overfit. It's similar to the number of units in an LSTM/GRU architecture too.
+- `kernel_size`: Controls the spatial area/volume considered in the convolutional ops. Good values are usually between 2 and 8. If you think your sequence heavily depends on t-1 and t-2, but less on the rest, then choose a kernel size of 2/3. For NLP tasks, we prefer bigger kernel sizes. A large kernel size will make your network much bigger.
+- `dilations`: It controls how deep your TCN layer is. Usually, consider a list with multiple of two. You can guess how many dilations you need by matching the receptive field (of the TCN) with the length of features in your sequence. For example, if your input sequence is periodic, you might want to have multiples of that period as dilations.
+- `nb_stacks`: Not very useful unless your sequences are very long (like waveforms with hundreds of thousands of time steps).
+- `padding`: I have only used `causal` since a TCN stands for Temporal Convolutional Networks. Causal prevents information leakage.
+- `use_skip_connections`: Skip connections connects layers, similarly to DenseNet. It helps the gradients flow. Unless you experience a drop in performance, you should always activate it.
+- `return_sequences`: Same as the one present in the LSTM layer. Refer to the Keras doc for this parameter.
+- `dropout_rate`: Similar to `recurrent_dropout` for the LSTM layer. I usually don't use it much. Or set it to a low value like `0.05`.
+- `activation`: Leave it to default. I have never changed it.
+- `kernel_initializer`: If the training of the TCN gets stuck, it might be worth changing this parameter. For example: `glorot_uniform`.
+
+- `use_batch_norm`, `use_layer_norm`: Use normalization if your network is big enough and the task contains enough data. I usually prefer using `use_layer_norm`, but you can try and see which one works the best.
+
 
 ### Receptive field
 
-- Receptive field = **nb_stacks_of_residuals_blocks * kernel_size * last_dilation**.
-- If a TCN has only one stack of residual blocks with a kernel size of 2 and dilations [1, 2, 4, 8], its receptive field is 2 * 1 * 8 = 16. The image below illustrates it:
+The receptive field is defined as: the maximum number of steps back in time from current sample at time T, that a filter from (block, layer, stack, TCN) can hit (effective history) + 1. The receptive field of the TCN can be calculated using the formula:
+<p align="center">
+  <img width="400" src="https://user-images.githubusercontent.com/4516927/112719508-a55bd200-8f3c-11eb-83c0-88c6171a07d7.png">
+</p>
+
+where N<sub>stack</sub> is the number of stacks, N<sub>b</sub> is the number of residual blocks per stack, d is a vector containing the dilations of each residual block in each stack, and K is the kernel size. The 2 is there because there are two `Conv1d` layers in a single `ResidualBlock`.
+
+Ideally you want your receptive field to be bigger than the largest length of input sequence, if you pass a sequence longer than your receptive field into the model, any extra values (further back in the sequence) will be replaced with zeros.
+
+#### Examples
+
+*NOTE*: Unlike the TCN, example figures only include a single `Conv1d` per layer, so the formula becomes R<sub>field</sub> = 1 + (K-1)⋅N<sub>stack</sub>⋅Σi di (without the factor 2).
+
+- If a dilated conv net has only one stack of residual blocks with a kernel size of `2` and dilations `[1, 2, 4, 8]`, its receptive field is `16`. The image below illustrates it:
 
 <p align="center">
   <img src="https://user-images.githubusercontent.com/40159126/41830054-10e56fda-7871-11e8-8591-4fa46680c17f.png">
   <b>ks = 2, dilations = [1, 2, 4, 8], 1 block</b><br><br>
 </p>
 
-- If the TCN has now 2 stacks of residual blocks, wou would get the situation below, that is, an increase in the receptive field to 32:
+- If a dilated conv net has 2 stacks of residual blocks, you would have the situation below, that is, an increase in the receptive field up to 31:
 
 <p align="center">
   <img src="https://user-images.githubusercontent.com/40159126/41830618-a8f82a8a-7874-11e8-9d4f-2ebb70a31465.jpg">
@@ -148,7 +135,6 @@ For a Many to Many regression, a cheap fix for now is to change the [number of u
   <b>ks = 2, dilations = [1, 2, 4, 8], 3 blocks</b><br><br>
 </p>
 
-Thanks a lot to [@alextheseal](https://github.com/alextheseal) for providing such visuals.
 
 ### Non-causal TCN
 
@@ -161,22 +147,11 @@ However, it is not anymore suitable for real-time applications.
   <b>Non-Causal TCN - ks = 3, dilations = [1, 2, 4, 8], 1 block</b><br><br>
 </p>
 
-Special thanks to: [@qlemaire22](https://github.com/qlemaire22)
-
-## Installation
-
-```bash
-git clone git@github.com:philipperemy/keras-tcn.git
-cd keras-tcn
-virtualenv -p python3.6 venv
-source venv/bin/activate
-pip install -r requirements.txt # change to tensorflow if you dont have a gpu.
-pip install . --upgrade # install it as a package.
-```
+To use a non-causal TCN, specify `padding='valid'` or `padding='same'` when initializing the TCN layers.
 
 ## Run
 
-Once `keras-tcn` is installed as a package, you can take a glimpse of what's possible to do with TCNs. Some tasks examples are  available in the repository for this purpose:
+Once `keras-tcn` is installed as a package, you can take a glimpse of what is possible to do with TCNs. Some tasks examples are available in the repository for this purpose:
 
 ```bash
 cd adding_problem/
@@ -189,7 +164,18 @@ cd mnist_pixel/
 python main.py # run sequential mnist pixel task
 ```
 
+Reproducible results are possible on (NVIDIA) GPUs using the [tensorflow-determinism](https://github.com/NVIDIA/tensorflow-determinism) library. It was tested with keras-tcn by @lingdoc.
+
 ## Tasks
+
+### Word PTB
+
+Language modeling remains one of the primary applications of recurrent networks. In this example, we show that TCN can beat LSTM on the [WordPTB](tasks/word_ptb/README.md) task, without too much tuning.
+
+<p align="center">
+  <img src="tasks/word_ptb/result.png" width="800"><br>
+  <i>TCN vs LSTM (comparable number of weights)</i><br><br>
+</p>
 
 ### Adding Task
 
@@ -204,21 +190,11 @@ The task consists of feeding a large array of decimal numbers to the network, al
 
 #### Implementation results
 
-The model takes time to learn this task. It's symbolized by a very long plateau (could take ~8 epochs on some runs).
-
 ```
-200000/200000 [==============================] - 293s 1ms/step - loss: 0.1731 - val_loss: 0.1662
-200000/200000 [==============================] - 289s 1ms/step - loss: 0.1675 - val_loss: 0.1665
-200000/200000 [==============================] - 287s 1ms/step - loss: 0.1670 - val_loss: 0.1665
-200000/200000 [==============================] - 288s 1ms/step - loss: 0.1668 - val_loss: 0.1669
-200000/200000 [==============================] - 285s 1ms/step - loss: 0.1085 - val_loss: 0.0019
-200000/200000 [==============================] - 285s 1ms/step - loss: 0.0011 - val_loss: 4.1667e-04
-200000/200000 [==============================] - 282s 1ms/step - loss: 6.0470e-04 - val_loss: 6.7708e-04
-200000/200000 [==============================] - 282s 1ms/step - loss: 4.3099e-04 - val_loss: 7.3898e-04
-200000/200000 [==============================] - 282s 1ms/step - loss: 3.9102e-04 - val_loss: 1.8727e-04
-200000/200000 [==============================] - 280s 1ms/step - loss: 3.1040e-04 - val_loss: 0.0010
-200000/200000 [==============================] - 281s 1ms/step - loss: 3.1166e-04 - val_loss: 2.2333e-04
-200000/200000 [==============================] - 281s 1ms/step - loss: 2.8046e-04 - val_loss: 1.5194e-04
+782/782 [==============================] - 154s 197ms/step - loss: 0.8437 - val_loss: 0.1883
+782/782 [==============================] - 154s 196ms/step - loss: 0.0702 - val_loss: 0.0111
+[...]
+782/782 [==============================] - 152s 194ms/step - loss: 6.9630e-04 - val_loss: 3.7180e-04
 ```
 
 ### Copy Memory Task
@@ -240,13 +216,10 @@ The idea is to copy the content of the vector x to the end of the large array. T
 #### Implementation results (first epochs)
 
 ```
-30000/30000 [==============================] - 30s 1ms/step - loss: 0.1174 - acc: 0.9586 - val_loss: 0.0370 - val_acc: 0.9859
-30000/30000 [==============================] - 26s 874us/step - loss: 0.0367 - acc: 0.9859 - val_loss: 0.0363 - val_acc: 0.9859
-30000/30000 [==============================] - 26s 852us/step - loss: 0.0361 - acc: 0.9859 - val_loss: 0.0358 - val_acc: 0.9859
-30000/30000 [==============================] - 26s 872us/step - loss: 0.0355 - acc: 0.9859 - val_loss: 0.0349 - val_acc: 0.9859
-30000/30000 [==============================] - 25s 850us/step - loss: 0.0339 - acc: 0.9864 - val_loss: 0.0291 - val_acc: 0.9881
-30000/30000 [==============================] - 26s 856us/step - loss: 0.0235 - acc: 0.9896 - val_loss: 0.0159 - val_acc: 0.9944
-30000/30000 [==============================] - 26s 872us/step - loss: 0.0169 - acc: 0.9929 - val_loss: 0.0125 - val_acc: 0.9966
+118/118 [==============================] - 17s 143ms/step - loss: 1.1732 - accuracy: 0.6725 - val_loss: 0.1119 - val_accuracy: 0.9796
+[...]
+118/118 [==============================] - 15s 125ms/step - loss: 0.0268 - accuracy: 0.9885 - val_loss: 0.0206 - val_accuracy: 0.9908
+118/118 [==============================] - 15s 125ms/step - loss: 0.0228 - accuracy: 0.9900 - val_loss: 0.0169 - val_accuracy: 0.9933
 ```
 
 ### Sequential MNIST
@@ -263,19 +236,39 @@ The idea here is to consider MNIST images as 1-D sequences and feed them to the 
 #### Implementation results
 
 ```
-60000/60000 [==============================] - 118s 2ms/step - loss: 0.2348 - acc: 0.9265 - val_loss: 0.1308 - val_acc: 0.9579
-60000/60000 [==============================] - 116s 2ms/step - loss: 0.0973 - acc: 0.9698 - val_loss: 0.0645 - val_acc: 0.9798
+1875/1875 [==============================] - 46s 25ms/step - loss: 0.0949 - accuracy: 0.9706 - val_loss: 0.0763 - val_accuracy: 0.9756
+1875/1875 [==============================] - 46s 25ms/step - loss: 0.0831 - accuracy: 0.9743 - val_loss: 0.0656 - val_accuracy: 0.9807
 [...]
-60000/60000 [==============================] - 112s 2ms/step - loss: 0.0075 - acc: 0.9978 - val_loss: 0.0547 - val_acc: 0.9894
-60000/60000 [==============================] - 111s 2ms/step - loss: 0.0093 - acc: 0.9968 - val_loss: 0.0585 - val_acc: 0.9895
+1875/1875 [==============================] - 46s 25ms/step - loss: 0.0486 - accuracy: 0.9840 - val_loss: 0.0572 - val_accuracy: 0.9832
+1875/1875 [==============================] - 46s 25ms/step - loss: 0.0453 - accuracy: 0.9858 - val_loss: 0.0424 - val_accuracy: 0.9862
 ```
 
+## R Language
+
+For a fully working example of Keras TCN using **R Language**, [browse here](https://github.com/philipperemy/keras-tcn/issues/246).
 
 ## References
 - https://github.com/locuslab/TCN/ (TCN for Pytorch)
-- https://arxiv.org/pdf/1803.01271.pdf (An Empirical Evaluation of Generic Convolutional and Recurrent Networks
+- https://arxiv.org/pdf/1803.01271 (An Empirical Evaluation of Generic Convolutional and Recurrent Networks
 for Sequence Modeling)
-- https://arxiv.org/pdf/1609.03499.pdf (Original Wavenet paper)
+- https://arxiv.org/pdf/1609.03499 (Original Wavenet paper)
+- - https://github.com/Baichenjia/Tensorflow-TCN (Tensorflow Eager implementation of TCNs)
 
-### Repo views (since 2018/10/30)
-[![HitCount](http://hits.dwyl.io/philipperemy/keras-tcn.svg)](http://hits.dwyl.io/philipperemy/keras-tcn)
+## Citation
+
+```
+@misc{KerasTCN,
+  author = {Philippe Remy},
+  title = {Temporal Convolutional Networks for Keras},
+  year = {2020},
+  publisher = {GitHub},
+  journal = {GitHub repository},
+  howpublished = {\url{https://github.com/philipperemy/keras-tcn}},
+}
+```
+
+## Contributors
+
+<a href="https://github.com/philipperemy/keras-tcn/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=philipperemy/keras-tcn" />
+</a>

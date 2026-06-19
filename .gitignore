@@ -5,6 +5,7 @@ __pycache__/
 .idea/
 .DS_Store
 
+*.h5
 *.tsv
 *.tar.gz
 *out*
@@ -112,3 +113,5 @@ ENV/
 
 # mypy
 .mypy_cache/
+
+!/tasks/exchange_rate/exchange_rate.txt

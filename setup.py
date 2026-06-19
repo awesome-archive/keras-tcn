@@ -1,15 +1,25 @@
+import os
+import platform
+
 from setuptools import setup
+
+tensorflow = 'tensorflow'
+if platform.system() == 'Darwin' and platform.processor() == 'arm':
+    tensorflow = 'tensorflow-macos'
+    # https://github.com/grpc/grpc/issues/25082
+    os.environ['GRPC_PYTHON_BUILD_SYSTEM_OPENSSL'] = '1'
+    os.environ['GRPC_PYTHON_BUILD_SYSTEM_ZLIB'] = '1'
+
+install_requires = ['numpy', tensorflow]
 
 setup(
     name='keras-tcn',
-    version='2.3.5',
+    version='3.5.7',
     description='Keras TCN',
     author='Philippe Remy',
-    license='MIT',
+    license_files=['MIT'],
     long_description_content_type='text/markdown',
     long_description=open('README.md').read(),
     packages=['tcn'],
-    # manually install tensorflow or tensorflow-gpu
-    install_requires=['numpy',
-                      'keras']
+    install_requires=install_requires
 )
